@@ -1,0 +1,308 @@
+//@version=5
+indicator("Harmonic Patterns Detector", overlay=true, max_bars_back=500, max_boxes=200, max_lines=500, max_labels=500)
+
+// ==================== INPUTS ====================
+group_pattern = "Pattern Settings"
+detectGartley = input(true, "Detect Gartley", group=group_pattern)
+detectButterfly = input(true, "Detect Butterfly", group=group_pattern)
+detectBat = input(true, "Detect Bat", group=group_pattern)
+detectCrab = input(true, "Detect Crab", group=group_pattern)
+detectCypher = input(true, "Detect Cypher", group=group_pattern)
+detectABCD = input(true, "Detect ABCD", group=group_pattern)
+detectShark = input(false, "Detect Shark", group=group_pattern)
+detect5O = input(false, "Detect 5-0", group=group_pattern)
+
+group_fib = "Fibonacci Tolerances"
+fibTolerance = input.float(5.0, "Tolerance (%)", minval=0.1, maxval=20, group=group_fib)
+
+group_trade = "Trade Settings"
+enableTrading = input(true, "Enable Trading Strategy", group=group_trade)
+useATR = input(true, "Use ATR for Stop Loss", group=group_trade)
+atrMultiplier = input.float(2.0, "ATR Multiplier", minval=0.5, group=group_trade)
+fixedStopLoss = input.float(2.0, "Fixed Stop Loss (%)", minval=0.1, group=group_trade)
+targetRR = input.float(2.0, "Target Risk/Reward Ratio", minval=0.5, group=group_trade)
+tradeSize = input.float(1.0, "Trade Size (contracts)", minval=0.1, group=group_trade)
+
+group_display = "Display Settings"
+showPatternLines = input(true, "Show Pattern Lines", group=group_display)
+showZigzag = input(true, "Show Zigzag", group=group_display)
+showLabels = input(true, "Show Labels", group=group_display)
+showFibLevels = input(true, "Show Fib Levels (D point)", group=group_display)
+darkMode = input(true, "Dark Mode Colors", group=group_display)
+
+// ==================== COLORS ====================
+col_gartley = color.new(color.yellow, 30)
+col_butterfly = color.new(color.orange, 30)
+col_bat = color.new(color.blue, 30)
+col_crab = color.new(color.red, 30)
+col_cypher = color.new(color.purple, 30)
+col_abcd = color.new(color.green, 30)
+col_shark = color.new(color.teal, 30)
+col_5o = color.new(color.maroon, 30)
+
+col_long = color.new(color.green, 50)
+col_short = color.new(color.red, 50)
+
+// ==================== ZIGZAG DETECTION ====================
+var float[] peaks = array.new<float>()
+var int[] peakBars = array.new<int>()
+var string[] peakTypes = array.new<string>() // "H" for high, "L" for low
+
+float zigzagThreshold = input.float(2.0, "Zigzag Threshold (%)", minval=0.1, group=group_display)
+
+f_updateZigzag() =>
+    maxLookback = 50
+    highestHigh = ta.highest(high, maxLookback)
+    lowestLow = ta.lowest(low, maxLookback)
+    
+    if array.size(peaks) == 0
+        array.push(peaks, close)
+        array.push(peakBars, bar_index)
+        array.push(peakTypes, "L")
+    else
+        lastPeak = array.get(peaks, array.size(peaks) - 1)
+        lastType = array.get(peakTypes, array.size(peakTypes) - 1)
+        
+        if lastType == "L"
+            if high >= lastPeak * (1 + zigzagThreshold / 100)
+                array.push(peaks, high)
+                array.push(peakBars, bar_index)
+                array.push(peakTypes, "H")
+        else
+            if low <= lastPeak * (1 - zigzagThreshold / 100)
+                array.push(peaks, low)
+                array.push(peakBars, bar_index)
+                array.push(peakTypes, "L")
+    
+    // Keep only last 20 peaks to avoid memory issues
+    if array.size(peaks) > 20
+        array.shift(peaks)
+        array.shift(peakBars)
+        array.shift(peakTypes)
+
+f_updateZigzag()
+
+// ==================== FIBONACCI FUNCTIONS ====================
+f_isFibRatio(float actual, float expected, float tolerance) =>
+    diff = math.abs(actual - expected) / expected * 100
+    diff <= tolerance
+
+f_validateFibRatios(float xA, float aB, float bC, float cD, float xD, string patternType) =>
+    ratio_AB_XA = aB / xA
+    ratio_BC_AB = bC / aB
+    ratio_CD_BC = cD / bC
+    ratio_AD_XA = xD / xA
+    
+    bool result = false
+    string details = ""
+    
+    switch patternType
+        "GARTLEY" =>
+            // AB = 0.618*XA, BC = 0.382-0.886*AB, CD = 1.272-1.618*BC, AD = 0.786*XA
+            result := f_isFibRatio(ratio_AB_XA, 0.618, fibTolerance) and 
+                     f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 1.272, fibTolerance) and
+                     f_isFibRatio(ratio_AD_XA, 0.786, fibTolerance)
+            details := "AB:618% BC:618% CD:127% AD:786%"
+        
+        "BUTTERFLY" =>
+            // AB = 0.786*XA, BC = 0.382-0.886*AB, CD = 1.618-2.618*BC, AD = 1.27*XA
+            result := f_isFibRatio(ratio_AB_XA, 0.786, fibTolerance) and
+                     f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 1.618, fibTolerance) and
+                     f_isFibRatio(ratio_AD_XA, 1.27, fibTolerance)
+            details := "AB:786% BC:618% CD:161% AD:127%"
+        
+        "BAT" =>
+            // AB = 0.382-0.5*XA, BC = 0.382-0.886*AB, CD = 1.618-2.618*BC, AD = 0.886*XA
+            result := (f_isFibRatio(ratio_AB_XA, 0.382, fibTolerance) or f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance)) and
+                     f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 2.0, fibTolerance) and
+                     f_isFibRatio(ratio_AD_XA, 0.886, fibTolerance)
+            details := "AB:382-50% BC:618% CD:200% AD:886%"
+        
+        "CRAB" =>
+            // AB = 0.382-0.618*XA, BC = 0.382-0.886*AB, CD = 2.618-3.618*BC, AD = 1.618*XA
+            result := f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance) and
+                     f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 2.618, fibTolerance) and
+                     f_isFibRatio(ratio_AD_XA, 1.618, fibTolerance)
+            details := "AB:50% BC:618% CD:261% AD:161%"
+        
+        "CYPHER" =>
+            // AB = 0.382-0.618*XA, BC = 1.128-1.618*AB, CD = 0.5-0.786*BC, AD = 0.786*XA
+            result := f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance) and
+                     f_isFibRatio(ratio_BC_AB, 1.272, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_AD_XA, 0.786, fibTolerance)
+            details := "AB:50% BC:127% CD:61% AD:786%"
+        
+        "ABCD" =>
+            // AB = CD, BC = 0.618*AB or BC = 0.382*AB
+            result := f_isFibRatio(cD / aB, 1.0, fibTolerance) and
+                     (f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) or f_isFibRatio(ratio_BC_AB, 0.382, fibTolerance))
+            details := "AB=CD BC:618or382%"
+        
+        "SHARK" =>
+            // AB = 0.382-0.618*XA, BC = 1.128-1.618*AB, CD = 1.618*BC, AD = 1.13-1.618*XA
+            result := f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance) and
+                     f_isFibRatio(ratio_BC_AB, 1.272, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 1.618, fibTolerance)
+            details := "AB:50% BC:127% CD:161%"
+        
+        "5-0" =>
+            // Complex pattern with specific ratios
+            result := f_isFibRatio(ratio_AB_XA, 1.618, fibTolerance) and
+                     f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+                     f_isFibRatio(ratio_CD_BC, 1.618, fibTolerance)
+            details := "AB:161% BC:618% CD:161%"
+    
+    [result, details, ratio_AB_XA, ratio_BC_AB, ratio_CD_BC, ratio_AD_XA]
+
+// ==================== PATTERN DETECTION ====================
+f_detectPattern(int x_idx, int a_idx, int b_idx, int c_idx, int d_idx) =>
+    if x_idx < 0 or a_idx < 0 or b_idx < 0 or c_idx < 0 or d_idx < 0
+        [false, "", "", 0.0, 0.0, 0.0, 0.0, 0.0]
+    else
+        x_price = array.get(peaks, x_idx)
+        a_price = array.get(peaks, a_idx)
+        b_price = array.get(peaks, b_idx)
+        c_price = array.get(peaks, c_idx)
+        d_price = array.get(peaks, d_idx)
+        
+        xA = math.abs(a_price - x_price)
+        aB = math.abs(b_price - a_price)
+        bC = math.abs(c_price - b_price)
+        cD = math.abs(d_price - c_price)
+        xD = math.abs(d_price - x_price)
+        
+        isLong = b_price < a_price and c_price > b_price and d_price < c_price
+        isShort = b_price > a_price and c_price < b_price and d_price > c_price
+        
+        [valid, details, r1, r2, r3, r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "")
+        
+        patternType = ""
+        if isLong or isShort
+            // Test all patterns
+            [g_valid, g_det, g_r1, g_r2, g_r3, g_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "GARTLEY")
+            if g_valid and detectGartley
+                patternType := "GARTLEY"
+                [valid, details, r1, r2, r3, r4] = [g_valid, g_det, g_r1, g_r2, g_r3, g_r4]
+            
+            if patternType == ""
+                [b_valid, b_det, b_r1, b_r2, b_r3, b_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "BUTTERFLY")
+                if b_valid and detectButterfly
+                    patternType := "BUTTERFLY"
+                    [valid, details, r1, r2, r3, r4] = [b_valid, b_det, b_r1, b_r2, b_r3, b_r4]
+            
+            if patternType == ""
+                [ba_valid, ba_det, ba_r1, ba_r2, ba_r3, ba_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "BAT")
+                if ba_valid and detectBat
+                    patternType := "BAT"
+                    [valid, details, r1, r2, r3, r4] = [ba_valid, ba_det, ba_r1, ba_r2, ba_r3, ba_r4]
+            
+            if patternType == ""
+                [cr_valid, cr_det, cr_r1, cr_r2, cr_r3, cr_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "CRAB")
+                if cr_valid and detectCrab
+                    patternType := "CRAB"
+                    [valid, details, r1, r2, r3, r4] = [cr_valid, cr_det, cr_r1, cr_r2, cr_r3, cr_r4]
+            
+            if patternType == ""
+                [cy_valid, cy_det, cy_r1, cy_r2, cy_r3, cy_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "CYPHER")
+                if cy_valid and detectCypher
+                    patternType := "CYPHER"
+                    [valid, details, r1, r2, r3, r4] = [cy_valid, cy_det, cy_r1, cy_r2, cy_r3, cy_r4]
+            
+            if patternType == ""
+                [ab_valid, ab_det, ab_r1, ab_r2, ab_r3, ab_r4] = f_validateFibRatios(xA, aB, bC, cD, xD, "ABCD")
+                if ab_valid and detectABCD
+                    patternType := "ABCD"
+                    [valid, details, r1, r2, r3, r4] = [ab_valid, ab_det, ab_r1, ab_r2, ab_r3, ab_r4]
+        
+        [patternType != "", patternType, details, r1, r2, r3, r4, xD]
+
+// ==================== DRAWING FUNCTIONS ====================
+f_drawPattern(int x_idx, int a_idx, int b_idx, int c_idx, int d_idx, string patternType, bool isBullish) =>
+    if not showPatternLines
+        return
+    
+    x_bar = array.get(peakBars, x_idx)
+    a_bar = array.get(peakBars, a_idx)
+    b_bar = array.get(peakBars, b_idx)
+    c_bar = array.get(peakBars, c_idx)
+    d_bar = array.get(peakBars, d_idx)
+    
+    x_price = array.get(peaks, x_idx)
+    a_price = array.get(peaks, a_idx)
+    b_price = array.get(peaks, b_idx)
+    c_price = array.get(peaks, c_idx)
+    d_price = array.get(peaks, d_idx)
+    
+    col = switch patternType
+        "GARTLEY" => col_gartley
+        "BUTTERFLY" => col_butterfly
+        "BAT" => col_bat
+        "CRAB" => col_crab
+        "CYPHER" => col_cypher
+        "ABCD" => col_abcd
+        "SHARK" => col_shark
+        "5-0" => col_5o
+        => color.gray
+    
+    line.new(x_bar, x_price, a_bar, a_price, color=col, width=2)
+    line.new(a_bar, a_price, b_bar, b_price, color=col, width=2)
+    line.new(b_bar, b_price, c_bar, c_price, color=col, width=2)
+    line.new(c_bar, c_price, d_bar, d_price, color=col, width=2)
+    
+    if showLabels
+        label.new(d_bar, d_price, patternType, color=col, style=label.style_label_up if isBullish else label.style_label_down, textcolor=color.white)
+
+f_drawFibLevels(float d_price, bool isBullish) =>
+    if not showFibLevels
+        return
+    
+    levels = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
+    
+    for i = 0 to array.size(levels) - 1
+        fib_level = array.get(levels, i)
+        level_price = d_price * fib_level
+        line.new(bar_index - 10, level_price, bar_index + 10, level_price, color=color.new(color.gray, 70), style=line.style_dashed)
+
+// ==================== MAIN LOGIC ====================
+f_scanPatterns() =>
+    arraySize = array.size(peaks)
+    
+    if arraySize < 5
+        return
+    
+    // Look for patterns in last 20 bars of zigzag
+    for i = 0 to math.min(arraySize - 5, 15)
+        for j = i + 1 to math.min(arraySize - 4, i + 10)
+            for k = j + 1 to math.min(arraySize - 3, j + 8)
+                for l = k + 1 to math.min(arraySize - 2, k + 6)
+                    for m = l + 1 to math.min(arraySize - 1, l + 4)
+                        [valid, pattern, details, r1, r2, r3, r4, xD] = f_detectPattern(i, j, k, l, m)
+                        
+                        if valid
+                            x_type = array.get(peakTypes, i)
+                            isBullish = x_type == "L"
+                            
+                            d_price = array.get(peaks, m)
+                            f_drawPattern(i, j, k, l, m, pattern, isBullish)
+                            f_drawFibLevels(d_price, isBullish)
+                            
+                            if enableTrading
+                                atr_val = ta.atr(14)
+                                
+                                if isBullish
+                                    sl = d_price - (useATR ? atr_val * atrMultiplier : d_price * fixedStopLoss / 100)
+                                    tp = d_price + (d_price - sl) * targetRR
+                                    strategy.entry("Long_" + pattern, strategy.long, qty=tradeSize, limit=d_price)
+                                    strategy.exit("Exit_Long_" + pattern, "Long_" + pattern, stop=sl, limit=tp)
+                                else
+                                    sl = d_price + (useATR ? atr_val * atrMultiplier : d_price * fixedStopLoss / 100)
+                                    tp = d_price - (sl - d_price) * targetRR
+                                    strategy.entry("Short_" + pattern, strategy.short, qty=tradeSize, limit=d_price)
+                                    strategy.exit("Exit_Short_" + pattern, "Short_" + pattern, stop=sl, limit=tp)
+
+f_scanPatterns()
