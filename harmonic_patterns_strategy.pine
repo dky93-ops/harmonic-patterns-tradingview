@@ -1,0 +1,441 @@
+//@version=5
+strategy("Harmonic Patterns Advanced Strategy", overlay=true, max_bars_back=500, default_qty_type=strategy.percent_of_equity, default_qty_value=5, pyramiding=0, process_orders_on_close=true)
+
+// ==================== INPUTS ====================
+group_pattern = "Pattern Settings"
+detectGartley = input(true, "Detect Gartley", group=group_pattern)
+detectButterfly = input(true, "Detect Butterfly", group=group_pattern)
+detectBat = input(true, "Detect Bat", group=group_pattern)
+detectCrab = input(true, "Detect Crab", group=group_pattern)
+detectCypher = input(true, "Detect Cypher", group=group_pattern)
+detectABCD = input(true, "Detect ABCD", group=group_pattern)
+
+group_fib = "Fibonacci Tolerances"
+fibTolerance = input.float(5.0, "Tolerance (%)", minval=0.1, maxval=20, group=group_fib)
+
+group_trade = "Trade Settings"
+enableTrading = input(true, "Enable Trading Strategy", group=group_trade)
+useATR = input(true, "Use ATR for Stop Loss", group=group_trade)
+atrMultiplier = input.float(2.0, "ATR Multiplier for SL", minval=0.5, maxval=5.0, group=group_trade)
+fixedStopLoss = input.float(2.0, "Fixed Stop Loss (%)", minval=0.1, maxval=10.0, group=group_trade)
+targetRR = input.float(2.0, "Target Risk/Reward Ratio", minval=0.5, maxval=5.0, group=group_trade)
+useTrailingStop = input(true, "Use Trailing Stop", group=group_trade)
+trailingStopPercent = input.float(1.5, "Trailing Stop (%)", minval=0.1, maxval=5.0, group=group_trade)
+
+group_mm = "Money Management"
+riskPercent = input.float(1.0, "Risk Per Trade (%)", minval=0.1, maxval=5.0, group=group_mm)
+maxOpenTrades = input.int(3, "Max Open Trades", minval=1, maxval=5, group=group_mm)
+partialTpPercent = input.float(50, "Partial TP at 50% (%)", minval=10, maxval=100, group=group_mm)
+
+group_filters = "Trade Filters"
+enableTimeFilter = input(false, "Enable Time Filter", group=group_filters)
+startHour = input.int(9, "Start Hour (UTC)", minval=0, maxval=23, group=group_filters)
+endHour = input.int(17, "End Hour (UTC)", minval=0, maxval=23, group=group_filters)
+enableDayFilter = input(false, "Exclude Weekends", group=group_filters)
+
+group_display = "Display Settings"
+showPatternLines = input(true, "Show Pattern Lines", group=group_display)
+showZigzag = input(true, "Show Zigzag", group=group_display)
+showLabels = input(true, "Show Labels & Levels", group=group_display)
+showEntryExit = input(true, "Show Entry/Exit Points", group=group_display)
+
+// ==================== COLORS ====================
+col_gartley = color.new(color.yellow, 30)
+col_butterfly = color.new(color.orange, 30)
+col_bat = color.new(color.blue, 30)
+col_crab = color.new(color.red, 30)
+col_cypher = color.new(color.purple, 30)
+col_abcd = color.new(color.green, 30)
+
+col_line_gartley = color.yellow
+col_line_butterfly = color.orange
+col_line_bat = color.blue
+col_line_crab = color.red
+col_line_cypher = color.purple
+col_line_abcd = color.green
+
+col_entry_long = color.new(color.green, 0)
+col_entry_short = color.new(color.red, 0)
+col_exit = color.new(color.gray, 0)
+
+// ==================== GLOBAL VARIABLES ====================
+var float[] peaks = array.new<float>()
+var int[] peakBars = array.new<int>()
+var string[] peakTypes = array.new<string>()
+
+var string lastPatternFound = ""
+var int lastPatternBar = 0
+var float lastEntryPrice = 0.0
+var float lastStopLoss = 0.0
+var float lastTakeProfit = 0.0
+var bool lastIsBullish = true
+var float highestPrice = 0.0
+var float lowestPrice = 0.0
+
+var int openTradesCount = 0
+
+// ==================== ZIGZAG DETECTION ====================
+zigzagThreshold = input.float(2.0, "Zigzag Threshold (%)", minval=0.1, maxval=10.0, group=group_display)
+
+f_updateZigzag() =>
+    maxLookback = 50
+    
+    if array.size(peaks) == 0
+        array.push(peaks, close)
+        array.push(peakBars, bar_index)
+        array.push(peakTypes, "L")
+    else
+        lastPeak = array.get(peaks, array.size(peaks) - 1)
+        lastType = array.get(peakTypes, array.size(peakTypes) - 1)
+        lastBar = array.get(peakBars, array.size(peakBars) - 1)
+        
+        if lastType == "L"
+            if high >= lastPeak * (1 + zigzagThreshold / 100)
+                array.push(peaks, high)
+                array.push(peakBars, bar_index)
+                array.push(peakTypes, "H")
+        else
+            if low <= lastPeak * (1 - zigzagThreshold / 100)
+                array.push(peaks, low)
+                array.push(peakBars, bar_index)
+                array.push(peakTypes, "L")
+    
+    if array.size(peaks) > 30
+        array.shift(peaks)
+        array.shift(peakBars)
+        array.shift(peakTypes)
+
+f_updateZigzag()
+
+// ==================== FIBONACCI VALIDATION ====================
+f_isFibRatio(float actual, float expected, float tolerance) =>
+    if expected == 0
+        false
+    else
+        diff = math.abs(actual - expected) / expected * 100
+        diff <= tolerance
+
+f_validateGartley(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_BC = bC != 0 ? cD / bC : 0
+    ratio_AD_XA = xA != 0 ? xD / xA : 0
+    
+    result = f_isFibRatio(ratio_AB_XA, 0.618, fibTolerance) and 
+             f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+             f_isFibRatio(ratio_CD_BC, 1.272, fibTolerance) and
+             f_isFibRatio(ratio_AD_XA, 0.786, fibTolerance)
+    
+    [result, "GARTLEY: AB=61.8% BC=61.8% CD=127.2% AD=78.6%"]
+
+f_validateButterfly(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_BC = bC != 0 ? cD / bC : 0
+    ratio_AD_XA = xA != 0 ? xD / xA : 0
+    
+    result = f_isFibRatio(ratio_AB_XA, 0.786, fibTolerance) and
+             f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+             f_isFibRatio(ratio_CD_BC, 1.618, fibTolerance) and
+             f_isFibRatio(ratio_AD_XA, 1.27, fibTolerance)
+    
+    [result, "BUTTERFLY: AB=78.6% BC=61.8% CD=161.8% AD=127%"]
+
+f_validateBat(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_BC = bC != 0 ? cD / bC : 0
+    ratio_AD_XA = xA != 0 ? xD / xA : 0
+    
+    ab_valid = f_isFibRatio(ratio_AB_XA, 0.382, fibTolerance) or f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance)
+    result = ab_valid and
+             f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+             f_isFibRatio(ratio_CD_BC, 2.0, fibTolerance) and
+             f_isFibRatio(ratio_AD_XA, 0.886, fibTolerance)
+    
+    [result, "BAT: AB=38.2-50% BC=61.8% CD=200% AD=88.6%"]
+
+f_validateCrab(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_BC = bC != 0 ? cD / bC : 0
+    ratio_AD_XA = xA != 0 ? xD / xA : 0
+    
+    result = f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance) and
+             f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) and
+             f_isFibRatio(ratio_CD_BC, 2.618, fibTolerance) and
+             f_isFibRatio(ratio_AD_XA, 1.618, fibTolerance)
+    
+    [result, "CRAB: AB=50% BC=61.8% CD=261.8% AD=161.8%"]
+
+f_validateCypher(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_BC = bC != 0 ? cD / bC : 0
+    ratio_AD_XA = xA != 0 ? xD / xA : 0
+    
+    result = f_isFibRatio(ratio_AB_XA, 0.5, fibTolerance) and
+             f_isFibRatio(ratio_BC_AB, 1.272, fibTolerance) and
+             f_isFibRatio(ratio_CD_BC, 0.618, fibTolerance) and
+             f_isFibRatio(ratio_AD_XA, 0.786, fibTolerance)
+    
+    [result, "CYPHER: AB=50% BC=127.2% CD=61.8% AD=78.6%"]
+
+f_validateABCD(float xA, float aB, float bC, float cD, float xD) =>
+    ratio_AB_XA = xA != 0 ? aB / xA : 0
+    ratio_BC_AB = aB != 0 ? bC / aB : 0
+    ratio_CD_AB = aB != 0 ? cD / aB : 0
+    
+    bc_valid = f_isFibRatio(ratio_BC_AB, 0.618, fibTolerance) or f_isFibRatio(ratio_BC_AB, 0.382, fibTolerance)
+    result = f_isFibRatio(ratio_CD_AB, 1.0, fibTolerance) and bc_valid
+    
+    [result, "ABCD: CD=AB BC=61.8or38.2%"]
+
+// ==================== PATTERN DETECTION ====================
+f_detectPattern(int x_idx, int a_idx, int b_idx, int c_idx, int d_idx) =>
+    x_price = array.get(peaks, x_idx)
+    a_price = array.get(peaks, a_idx)
+    b_price = array.get(peaks, b_idx)
+    c_price = array.get(peaks, c_idx)
+    d_price = array.get(peaks, d_idx)
+    
+    xA = math.abs(a_price - x_price)
+    aB = math.abs(b_price - a_price)
+    bC = math.abs(c_price - b_price)
+    cD = math.abs(d_price - c_price)
+    xD = math.abs(d_price - x_price)
+    
+    isLong = b_price < a_price and c_price > b_price and d_price < c_price
+    isShort = b_price > a_price and c_price < b_price and d_price > c_price
+    
+    patternType = ""
+    patternDesc = ""
+    
+    if (isLong or isShort) and xA > 0
+        if detectGartley
+            [g_valid, g_desc] = f_validateGartley(xA, aB, bC, cD, xD)
+            if g_valid
+                patternType := "GARTLEY"
+                patternDesc := g_desc
+        
+        if patternType == "" and detectButterfly
+            [b_valid, b_desc] = f_validateButterfly(xA, aB, bC, cD, xD)
+            if b_valid
+                patternType := "BUTTERFLY"
+                patternDesc := b_desc
+        
+        if patternType == "" and detectBat
+            [ba_valid, ba_desc] = f_validateBat(xA, aB, bC, cD, xD)
+            if ba_valid
+                patternType := "BAT"
+                patternDesc := ba_desc
+        
+        if patternType == "" and detectCrab
+            [cr_valid, cr_desc] = f_validateCrab(xA, aB, bC, cD, xD)
+            if cr_valid
+                patternType := "CRAB"
+                patternDesc := cr_desc
+        
+        if patternType == "" and detectCypher
+            [cy_valid, cy_desc] = f_validateCypher(xA, aB, bC, cD, xD)
+            if cy_valid
+                patternType := "CYPHER"
+                patternDesc := cy_desc
+        
+        if patternType == "" and detectABCD
+            [ab_valid, ab_desc] = f_validateABCD(xA, aB, bC, cD, xD)
+            if ab_valid
+                patternType := "ABCD"
+                patternDesc := ab_desc
+    
+    [patternType != "", patternType, patternDesc, d_price]
+
+// ==================== TRADE FILTERS ====================
+f_isTimeValid() =>
+    if not enableTimeFilter
+        true
+    else
+        hour = hour(time)
+        hour >= startHour and hour <= endHour
+
+f_isDayValid() =>
+    if not enableDayFilter
+        true
+    else
+        dayofweek = dayofweek(time)
+        dayofweek != dayofweek.sunday and dayofweek != dayofweek.saturday
+
+f_canOpenTrade() =>
+    openTradesCount < maxOpenTrades and f_isTimeValid() and f_isDayValid()
+
+// ==================== DRAWING FUNCTIONS ====================
+f_drawPattern(int x_idx, int a_idx, int b_idx, int c_idx, int d_idx, string patternType) =>
+    if not showPatternLines
+        return
+    
+    x_bar = array.get(peakBars, x_idx)
+    a_bar = array.get(peakBars, a_idx)
+    b_bar = array.get(peakBars, b_idx)
+    c_bar = array.get(peakBars, c_idx)
+    d_bar = array.get(peakBars, d_idx)
+    
+    x_price = array.get(peaks, x_idx)
+    a_price = array.get(peaks, a_idx)
+    b_price = array.get(peaks, b_idx)
+    c_price = array.get(peaks, c_idx)
+    d_price = array.get(peaks, d_idx)
+    
+    col = switch patternType
+        "GARTLEY" => col_line_gartley
+        "BUTTERFLY" => col_line_butterfly
+        "BAT" => col_line_bat
+        "CRAB" => col_line_crab
+        "CYPHER" => col_line_cypher
+        "ABCD" => col_line_abcd
+        => color.gray
+    
+    line.new(x_bar, x_price, a_bar, a_price, color=col, width=2)
+    line.new(a_bar, a_price, b_bar, b_price, color=col, width=2)
+    line.new(b_bar, b_price, c_bar, c_price, color=col, width=2)
+    line.new(c_bar, c_price, d_bar, d_price, color=col, width=2)
+    
+    if showLabels
+        label.new(d_bar, d_price, patternType, color=col, style=label.style_label_center, textcolor=color.white, size=size.small)
+
+f_drawEntryExit(int barIdx, float price, bool isEntry, bool isBullish) =>
+    if not showEntryExit
+        return
+    
+    col = isEntry ? (isBullish ? col_entry_long : col_entry_short) : col_exit
+    lbl_text = isEntry ? (isBullish ? "BUY" : "SELL") : "EXIT"
+    lbl_style = isEntry ? (isBullish ? label.style_label_up : label.style_label_down) : label.style_label_center
+    
+    label.new(barIdx, price, lbl_text, color=col, style=lbl_style, textcolor=color.white, size=size.tiny)
+
+f_drawFibLevels(float d_price, int barIdx) =>
+    if not showLabels
+        return
+    
+    levels = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618)
+    labels = array.from("0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%", "127.2%", "161.8%")
+    
+    for i = 0 to array.size(levels) - 1
+        fib_level = array.get(levels, i)
+        level_price = d_price + (d_price * fib_level)
+        lbl_text = array.get(labels, i)
+        label.new(barIdx + 5, level_price, lbl_text, color=color.new(color.gray, 70), style=label.style_label_left, textcolor=color.gray, size=size.tiny)
+
+// ==================== TRADE EXECUTION ====================
+f_executeTradeEntry(string patternType, bool isBullish, float entryPrice, float stopLoss, float takeProfit) =>
+    if not f_canOpenTrade()
+        return
+    
+    risk_amount = strategy.equity * (riskPercent / 100)
+    stop_distance = math.abs(entryPrice - stopLoss)
+    
+    if stop_distance > 0
+        qty = risk_amount / stop_distance
+        
+        if isBullish
+            strategy.entry(patternType + "_LONG", strategy.long, qty=qty, limit=entryPrice)
+            strategy.exit(patternType + "_EXIT", patternType + "_LONG", stop=stopLoss, limit=takeProfit)
+        else
+            strategy.entry(patternType + "_SHORT", strategy.short, qty=qty, limit=entryPrice)
+            strategy.exit(patternType + "_EXIT", patternType + "_SHORT", stop=stopLoss, limit=takeProfit)
+        
+        lastPatternFound := patternType
+        lastPatternBar := bar_index
+        lastEntryPrice := entryPrice
+        lastStopLoss := stopLoss
+        lastTakeProfit := takeProfit
+        lastIsBullish := isBullish
+        highestPrice := entryPrice
+        lowestPrice := entryPrice
+        openTradesCount := openTradesCount + 1
+
+// ==================== MAIN SCANNING LOGIC ====================
+f_scanPatterns() =>
+    arraySize = array.size(peaks)
+    
+    if arraySize < 5
+        return
+    
+    limit = math.min(arraySize - 5, 20)
+    
+    for i = 0 to limit
+        for j = i + 1 to math.min(arraySize - 4, i + 12)
+            for k = j + 1 to math.min(arraySize - 3, j + 10)
+                for l = k + 1 to math.min(arraySize - 2, l + 6)
+                    for m = l + 1 to math.min(arraySize - 1, l + 4)
+                        if m >= array.size(peaks)
+                            continue
+                        
+                        [valid, pattern, details, d_price] = f_detectPattern(i, j, k, l, m)
+                        
+                        if valid
+                            x_type = array.get(peakTypes, i)
+                            isBullish = x_type == "L"
+                            
+                            f_drawPattern(i, j, k, l, m, pattern)
+                            f_drawFibLevels(d_price, array.get(peakBars, m))
+                            
+                            if enableTrading and f_canOpenTrade()
+                                atr_val = ta.atr(14)
+                                
+                                if isBullish
+                                    sl = d_price - (useATR ? atr_val * atrMultiplier : d_price * fixedStopLoss / 100)
+                                    tp = d_price + (d_price - sl) * targetRR
+                                    f_executeTradeEntry(pattern, true, d_price, sl, tp)
+                                    f_drawEntryExit(bar_index, d_price, true, true)
+                                else
+                                    sl = d_price + (useATR ? atr_val * atrMultiplier : d_price * fixedStopLoss / 100)
+                                    tp = d_price - (sl - d_price) * targetRR
+                                    f_executeTradeEntry(pattern, false, d_price, sl, tp)
+                                    f_drawEntryExit(bar_index, d_price, true, false)
+
+f_scanPatterns()
+
+// ==================== TRAILING STOP LOGIC ====================
+if useTrailingStop and lastPatternBar > 0
+    if lastIsBullish
+        highestPrice := math.max(highestPrice, high)
+        newTrailingSL = highestPrice * (1 - trailingStopPercent / 100)
+        if newTrailingSL > lastStopLoss
+            lastStopLoss := newTrailingSL
+    else
+        lowestPrice := math.min(lowestPrice, low)
+        newTrailingSL = lowestPrice * (1 + trailingStopPercent / 100)
+        if newTrailingSL < lastStopLoss
+            lastStopLoss := newTrailingSL
+
+// ==================== MONITORING & ALERTS ====================
+if strategy.opentrades > 0
+    openTradesCount := strategy.opentrades
+else
+    openTradesCount := 0
+
+// Display Trade Info
+var table tradeTable = na
+if na(tradeTable) and showLabels
+    tradeTable := table.new(position.top_right, 2, 5, border_color=color.gray, frame_color=color.gray)
+    table.cell(tradeTable, 0, 0, "Pattern", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tradeTable, 1, 0, lastPatternFound, text_color=color.white, bgcolor=color.new(color.blue, 50))
+    table.cell(tradeTable, 0, 1, "Open Trades", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tradeTable, 1, 1, str.tostring(openTradesCount), text_color=color.white, bgcolor=color.new(color.blue, 50))
+    table.cell(tradeTable, 0, 2, "Entry", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tradeTable, 1, 2, str.format("{0:.2f}", lastEntryPrice), text_color=color.white, bgcolor=color.new(color.blue, 50))
+    table.cell(tradeTable, 0, 3, "Stop Loss", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tradeTable, 1, 3, str.format("{0:.2f}", lastStopLoss), text_color=color.white, bgcolor=color.new(color.blue, 50))
+    table.cell(tradeTable, 0, 4, "Take Profit", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tradeTable, 1, 4, str.format("{0:.2f}", lastTakeProfit), text_color=color.white, bgcolor=color.new(color.blue, 50))
+
+// ==================== ALERTS ====================
+alertPatternFound = valid != false and lastPatternBar == bar_index
+alertLongSetup = alertPatternFound and lastIsBullish
+alertShortSetup = alertPatternFound and not lastIsBullish
+
+if alertLongSetup
+    alert(lastPatternFound + " Pattern BULLISH at " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if alertShortSetup
+    alert(lastPatternFound + " Pattern BEARISH at " + str.tostring(close), alert.freq_once_per_bar_close)
